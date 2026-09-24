@@ -113,6 +113,14 @@ func TestIsConstraintViolationError(t *testing.T) {
 			},
 			want: false,
 		},
+		{
+			desc: "constraint violation with custom rule",
+			err: &googleapi.Error{
+				Code:    http.StatusPreconditionFailed,
+				Message: "Operation denied by org policy: [customConstraints/custom.disableLoadBalancersWithLogging] : Some description of why this operation is not allowed.",
+			},
+			want: true,
+		},
 	}
 	for _, tC := range testCases {
 		t.Run(tC.desc, func(t *testing.T) {
