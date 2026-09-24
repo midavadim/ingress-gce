@@ -105,7 +105,14 @@ func IsUnsupportedNetworkTierError(err error) bool {
 
 // IsConstraintViolationError checks if the error is a constraint violation error returned by GCP.
 func IsConstraintViolationError(err error) bool {
-	return gceutils.IsHTTPErrorCode(err, http.StatusPreconditionFailed) && strings.Contains(err.Error(), "Constraint") && strings.Contains(err.Error(), "violated")
+	if !gceutils.IsHTTPErrorCode(err, http.StatusPreconditionFailed) {
+		return false
+	}
+
+	errMsg := err.Error()
+	isCustomConstraint := strings.Contains(errMsg, "Operation denied by org policy")
+	isConstraint := strings.Contains(errMsg, "Constraint") && strings.Contains(errMsg, "violated")
+	return isConstraint || isCustomConstraint
 }
 
 // IsInternalForwardingRuleQuotaExceededError checks if the error is an internal forwarding rule quota exceeded error returned by GCP.
