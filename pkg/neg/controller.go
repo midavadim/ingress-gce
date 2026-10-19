@@ -18,6 +18,7 @@ package neg
 
 import (
 	"fmt"
+	"reflect"
 	"strings"
 	"time"
 
@@ -512,7 +513,28 @@ func NewController(
 			AddFunc:    negController.enqueueNEGBinding,
 			DeleteFunc: negController.enqueueNEGBinding,
 			UpdateFunc: func(old, cur interface{}) {
-				negController.enqueueNEGBinding(cur)
+				oldBinding, ok1 := old.(*negbindingv1beta1.NetworkEndpointGroupBinding)
+				curBinding, ok2 := cur.(*negbindingv1beta1.NetworkEndpointGroupBinding)
+				if !ok1 || !ok2 {
+					return
+				}
+				// Every syncer execution patches Status (e.g. LastSyncTime and Conditions),
+				// which triggers an informer Update event. Avoid enqueuing on status-only
+				// updates so we do not trigger EnsureSyncerForNEGBinding -> syncer.Sync() in
+				// a self-reinforcing loop that bypasses syncer exponential backoff and
+				// retries indefinitely after maxRetries.
+				specChanged := !reflect.DeepEqual(oldBinding.Spec, curBinding.Spec)
+				deletionStarted := (oldBinding.DeletionTimestamp == nil) != (curBinding.DeletionTimestamp == nil)
+				// During deletion, the syncer clears Status.NetworkEndpointGroups once
+				// endpoint draining completes; we must enqueue this transition so
+				// ReconcileDeletion can remove the finalizer.
+				drainingCompleted := curBinding.DeletionTimestamp != nil &&
+					len(oldBinding.Status.NetworkEndpointGroups) > 0 &&
+					len(curBinding.Status.NetworkEndpointGroups) == 0
+
+				if specChanged || deletionStarted || drainingCompleted {
+					negController.enqueueNEGBinding(cur)
+				}
 			},
 		})
 	}

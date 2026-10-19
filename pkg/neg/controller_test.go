@@ -2997,3 +2997,176 @@ func TestBuildClusterURL(t *testing.T) {
 		})
 	}
 }
+
+type eventCapturingInformer struct {
+	cache.SharedIndexInformer
+	handler cache.ResourceEventHandler
+}
+
+func (f *eventCapturingInformer) AddEventHandler(handler cache.ResourceEventHandler) (cache.ResourceEventHandlerRegistration, error) {
+	f.handler = handler
+	return f.SharedIndexInformer.AddEventHandler(handler)
+}
+
+func TestNEGBindingInformerUpdateFilter(t *testing.T) {
+	oldFlag := flags.F.EnableMultiSubnetClusterPhase1
+	flags.F.EnableMultiSubnetClusterPhase1 = true
+	defer func() { flags.F.EnableMultiSubnetClusterPhase1 = oldFlag }()
+
+	kubeClient := fake.NewSimpleClientset()
+	fakeNBClient := negbindingfake.NewSimpleClientset()
+	testContext := negtypes.NewTestContextWithKubeClient(kubeClient)
+	if err := negtypes.MockContainerService(testContext.Cloud); err != nil {
+		t.Fatalf("failed to mock container service: %v", err)
+	}
+
+	rawInformer := informernegbinding.NewNetworkEndpointGroupBindingInformer(fakeNBClient, "", 0, utils.NewNamespaceIndexer())
+	_ = rawInformer.AddIndexers(cache.Indexers{ServiceKeyIndex: ServiceKeyIndexFunc})
+	capturingInformer := &eventCapturingInformer{SharedIndexInformer: rawInformer}
+
+	zoneGetter, err := zonegetter.NewFakeZoneGetter(testContext.NodeInformer, zonegetter.FakeNodeTopologyInformer(), defaultTestSubnetURL, false)
+	if err != nil {
+		t.Fatalf("failed to create fake zone getter: %v", err)
+	}
+
+	controller, err := NewController(
+		kubeClient,
+		testContext.SvcNegClient,
+		fakeNBClient,
+		kubeClient,
+		testContext.KubeSystemUID,
+		testContext.IngressInformer,
+		testContext.ServiceInformer,
+		testContext.PodInformer,
+		testContext.NodeInformer,
+		testContext.EndpointSliceInformer,
+		testContext.SvcNegInformer,
+		capturingInformer,
+		testContext.NetworkInformer,
+		testContext.GKENetworkParamSetInformer,
+		testContext.NodeTopologyInformer,
+		func() bool { return true },
+		testContext.L4Namer,
+		defaultBackend,
+		negtypes.NewAdapterWithNetwork(testContext.Cloud, "default-network", defaultTestSubnetURL, testContext.NegMetrics),
+		zoneGetter,
+		testContext.NegNamer,
+		testContext.ResyncPeriod,
+		testContext.ResyncPeriod,
+		testContext.NumGCWorkers,
+		false, false, false,
+		testContext.EnableDualStackNEG,
+		labels.PodLabelPropagationConfig{},
+		true, false, false, false, true, true, false,
+		make(<-chan struct{}),
+		klog.TODO(),
+		testContext.NegMetrics,
+		metricscollector.FakeSyncerMetrics(),
+	)
+	if err != nil {
+		t.Fatalf("failed to create test controller: %v", err)
+	}
+	defer controller.stop()
+
+	if capturingInformer.handler == nil {
+		t.Fatalf("expected negBindingInformer event handler to be registered")
+	}
+
+	baseBinding := &negbindingv1beta1.NetworkEndpointGroupBinding{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "ns1", Name: "binding1"},
+		Spec: negbindingv1beta1.NetworkEndpointGroupBindingSpec{
+			BackendRef: &negbindingv1beta1.BackendRefConfig{
+				Kind: negbindingv1beta1.ServiceKind,
+				Name: "svc1",
+				Port: 80,
+			},
+			NetworkEndpointGroups: []negbindingv1beta1.SpecNegRef{
+				{Name: "neg-1", Subnet: "default", Zones: []string{"us-central1-a"}},
+			},
+		},
+		Status: negbindingv1beta1.NetworkEndpointGroupBindingStatus{
+			NetworkEndpointGroups: []negbindingv1beta1.StatusNegRef{
+				{ResourceURL: "zones/us-central1-a/networkEndpointGroups/neg-1"},
+			},
+		},
+	}
+
+	now := metav1.Now()
+	later := metav1.NewTime(now.Add(10 * time.Second))
+
+	statusOnlyUpdated := baseBinding.DeepCopy()
+	statusOnlyUpdated.Status.LastSyncTime = later
+	statusOnlyUpdated.Status.Conditions = []negbindingv1beta1.Condition{
+		{Type: "NegSynced", Status: metav1.ConditionFalse, Reason: "NegSyncFailed"},
+	}
+
+	specUpdated := baseBinding.DeepCopy()
+	specUpdated.Spec.NetworkEndpointGroups[0].Zones = []string{"us-central1-a", "us-central1-b"}
+
+	deletingWithNEGs := baseBinding.DeepCopy()
+	deletingWithNEGs.DeletionTimestamp = &now
+
+	deletingStatusUpdatedStillWithNEGs := deletingWithNEGs.DeepCopy()
+	deletingStatusUpdatedStillWithNEGs.Status.LastSyncTime = later
+
+	deletingDrained := deletingWithNEGs.DeepCopy()
+	deletingDrained.Status.NetworkEndpointGroups = nil
+
+	testCases := []struct {
+		desc        string
+		oldObj      interface{}
+		curObj      interface{}
+		wantEnqueue bool
+	}{
+		{
+			desc:        "status-only update (e.g. LastSyncTime or Conditions) does not enqueue",
+			oldObj:      baseBinding,
+			curObj:      statusOnlyUpdated,
+			wantEnqueue: false,
+		},
+		{
+			desc:        "spec change enqueues binding",
+			oldObj:      baseBinding,
+			curObj:      specUpdated,
+			wantEnqueue: true,
+		},
+		{
+			desc:        "deletion started (DeletionTimestamp set) enqueues binding",
+			oldObj:      baseBinding,
+			curObj:      deletingWithNEGs,
+			wantEnqueue: true,
+		},
+		{
+			desc:        "status update during deletion while NEGs still present does not enqueue",
+			oldObj:      deletingWithNEGs,
+			curObj:      deletingStatusUpdatedStillWithNEGs,
+			wantEnqueue: false,
+		},
+		{
+			desc:        "draining completed during deletion (Status.NetworkEndpointGroups cleared) enqueues binding",
+			oldObj:      deletingWithNEGs,
+			curObj:      deletingDrained,
+			wantEnqueue: true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.desc, func(t *testing.T) {
+			capturingInformer.handler.OnUpdate(tc.oldObj, tc.curObj)
+			gotLen := controller.negBindingQueue.Len()
+			if tc.wantEnqueue {
+				if gotLen != 1 {
+					t.Fatalf("expected queue length 1, got %d", gotLen)
+				}
+				item, _ := controller.negBindingQueue.Get()
+				controller.negBindingQueue.Done(item)
+				controller.negBindingQueue.Forget(item)
+			} else {
+				if gotLen != 0 {
+					t.Fatalf("expected queue length 0, got %d", gotLen)
+				}
+			}
+		})
+	}
+}
+
